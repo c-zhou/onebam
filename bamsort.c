@@ -34,6 +34,8 @@
 
 #define PROGRAM "bamsort"
 
+static char *TEMPDIR = ".";
+
 static void infomsg(char *format, ...);
 static void errmsg(char *format, ...);
 static void warnmsg(char *format, ...);
@@ -1022,9 +1024,12 @@ static void *bam_stream_data(void *args)
     stream->nrec[dindex] = nrec;
 
     // mapping reference
-    if (refmap)
-        for (i = 0; i < nrec; i++)
+    if (refmap) {
+        for (i = 0; i < nrec; i++) {
             recs[i]->core.tid = refmap[recs[i]->core.tid];
+            recs[i]->core.mtid = refmap[recs[i]->core.mtid];
+        }
+    }
 
     // calculate lcp array
     lcps[0] = 0;
@@ -2082,7 +2087,7 @@ static bool open_sorted_file(char *infile, srt_data_t *srt, refseq_builder_t *re
 bool mergebam(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threads, bool zstOutput);
 
 bool bamsort(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threads, 
-    bool noTrimHeader, bool zstOutput, bool mergeOnly)
+    bool noTrimHeader, bool zstOutput, char *tempDir, bool mergeOnly)
 {
     if (mergeOnly) return mergebam(infiles, nIn, outfile, max_mem, n_threads, zstOutput);
 
@@ -2105,8 +2110,22 @@ bool bamsort(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threa
     // set endianness
     long one = 1;
     IS_BIG_ENDIAN = !(*((char *)(&one)));
-    
+
     // sanity checks
+    // set temporary directory
+    if (tempDir) {
+        if (access(tempDir, W_OK | X_OK) ||
+            stat(tempDir, &st) || 
+            !S_ISDIR(st.st_mode)) {
+            // does not exist or not writable/traversable
+            errmsg("cannot access temporary directory: %s", tempDir);
+            return false;
+        } else {
+            // dir exists and is writable/traversable
+            TEMPDIR = tempDir;
+        }
+    }
+
     // input files
     if (infiles == NULL || nIn < 1) {
         errmsg("no input files specified");
@@ -2210,7 +2229,7 @@ bool bamsort(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threa
     pthread_cond_init(&WCOND,NULL);
 
     // set output file format
-    name_len = strlen(outfile) + 64;
+    name_len = strlen(TEMPDIR) + strlen(outfile) + 64;
     fn_template = (char *) malloc(name_len);
     if (!fn_template) {
         errmsg("file name buffer allocation failed");
@@ -2236,7 +2255,7 @@ bool bamsort(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threa
     }
     for (i = 0; i < nIn; i++) {
         infomsg("sorting input file [%d/%d]: %s", i+1, nIn, infiles[i]);
-        snprintf(fn_template, name_len, "%s.%.6d.XXXXXX", outfile, i+1);
+        snprintf(fn_template, name_len, "%s/%s.%.6d.XXXXXX", TEMPDIR, outfile, i+1);
         if (!bamsort1(infiles[i], fn_template, trim, multi_in, bio_data, 
             srt_data+i, refseqs, in_mem_check, zst_writer, zst_merge)) {
             errmsg("failed to sort input file: %s", infiles[i]);
@@ -2535,7 +2554,7 @@ bool mergebam(char **infiles, int nIn, char *outfile, size_t max_mem, int n_thre
     // set endianness
     long one = 1;
     IS_BIG_ENDIAN = !(*((char *)(&one)));
-    
+
     // sanity checks
     // input files
     if (infiles == NULL || nIn < 1) {
@@ -3817,6 +3836,7 @@ static void *map_refseq_core(void *args) {
     while (beg < end) {
         rec = *beg++;
         rec->core.tid = refmap[rec->core.tid];
+        rec->core.mtid = refmap[rec->core.mtid];
     }
     return NULL;
 }
@@ -3830,8 +3850,10 @@ static void map_refseq(bio_data_t *bio, size_t n_bio, int n_threads, int32_t *re
         for (b = 0; b < n_bio; b++) {
             recs = bio[b].recs;
             nrec = bio[b].nrec;
-            for (i = 0; i < nrec; i++)
+            for (i = 0; i < nrec; i++) {
                 recs[i]->core.tid = refmap[recs[i]->core.tid];
+                recs[i]->core.mtid = refmap[recs[i]->core.mtid];
+            }
         }
         return;
     }
@@ -5481,9 +5503,10 @@ static refseq_builder_t *refseq_builder_init(int capacity, size_t buff_size, cha
         if (!tmpl) goto fail;
         strcpy(tmpl, fn_template);
     } else {
-        tmpl = malloc(24);
+        tmpl = malloc(strlen(TEMPDIR) + 24);
         if (!tmpl) goto fail;
-        strcpy(tmpl, ".__bamsort.rdb.XXXXXX");
+        strcpy(tmpl, TEMPDIR);
+        strcat(tmpl, "/.__bamsort.rdb.XXXXXX");
     }
     int fd = mkstemp(tmpl);
     if (fd == -1) goto fail;

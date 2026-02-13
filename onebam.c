@@ -65,6 +65,7 @@ static char usage[] =
   "      -T <nthreads>                    number of threads [8]\n"
   "      -m <maxMem>                      maximum memory per thread; suffix K/M/G recognized [768M]\n"
   "      -M                               merge only - input files must be presorted\n"
+  "      -P <tempDir>                     temporary directory for sort files [.]\n"
   "      -zstOutput                       output ZSTD-compressed file\n"
   "      -noTrimHeader                    do not trim header\n"
 #ifndef HIDE
@@ -216,6 +217,7 @@ int main (int argc, char *argv[])
       bool noTrimHeader = false ;
       bool zstOutput = false ;
       bool mergeOnly = false ;
+      char *tempDir = "." ;
       while (argc && **argv == '-')
   if (!strcmp (*argv, "-o") && argc > 1)
           { outFileName = argv[1] ; argv += 2 ; argc -= 2 ; }
@@ -229,6 +231,8 @@ int main (int argc, char *argv[])
     }
   else if (!strcmp (*argv, "-T") && argc > 1)
           { NTHREAD = atoi (argv[1]) ; argv += 2 ; argc -= 2 ; }
+  else if (!strcmp (*argv, "-P") && argc > 1)
+    { tempDir = argv[1] ; argv += 2 ; argc -= 2 ; }
   else if (!strcmp (*argv, "-M"))
     { mergeOnly = true ; ++argv ; --argc ; }
   else if (!strcmp (*argv, "-noTrimHeader"))
@@ -238,7 +242,7 @@ int main (int argc, char *argv[])
   else die ("unknown onebam bamsort option %s - run without args for usage", *argv) ;
       if (argc < 1)
         die ("onebam bamsort needs at least 1 args; run without args for usage") ;
-      if (!bamsort (argv, argc, outFileName, max_mem, NTHREAD, noTrimHeader, zstOutput, mergeOnly))
+      if (!bamsort (argv, argc, outFileName, max_mem, NTHREAD, noTrimHeader, zstOutput, tempDir, mergeOnly))
         die ("failed to sort bam file %s", *argv) ;
     }
   else

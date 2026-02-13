@@ -148,7 +148,7 @@ bool reportLCA (char *readFileName, char *outFileName, char *rank, char *group) 
 // bamsort.c
 extern const size_t SORT_DEFAULT_MEGS_PER_THREAD ;
 bool bamsort (char **infiles, int nIn, char *outfile, size_t max_mem, int n_threads, 
-       bool noTrimHeader, bool zstOutput, bool mergeOnly) ;
+       bool noTrimHeader, bool zstOutput, char *tempDir, bool mergeOnly) ;
 
 // MSDsort.c
 void msd_sort (U8 *array, I64 nels, int rsize, int ksize, int depth, int mark, int nthreads) ;
