@@ -1219,7 +1219,6 @@ static inline int bw_bam_write_secondary(bam1_t *p_dat, bam1_t *rec, bam1_t **p_
         // first primary record - save to p_rec
         *p_rec = bam_copy1(p_dat, rec);
         *max_as = get_AS_score(rec);
-        *p_rec = p_dat;
         return 0;
     }
     // need to compare AS score
@@ -1348,7 +1347,6 @@ static inline int zstd_bam_write_secondary(bam1_t *p_dat, bam1_t *rec, bam1_t **
     if (*p_rec == NULL) {
         // first primary record - save to p_rec
         *p_rec = bam_copy1(p_dat, rec);
-        *p_rec = p_dat;
         *max_as = get_AS_score(rec);
         return 0;
     }
