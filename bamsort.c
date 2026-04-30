@@ -1,11 +1,11 @@
 /*  File: bamsort.c
  *  Author: Chenxi Zhou (cz370@cam.ac.uk)
- *  Copyright (C) University of Cambridge, 2025
+ *  Copyright (C) University of Cambridge, 2025,2026
  *-------------------------------------------------------------------
  * Description:
  * Exported functions:
  * HISTORY:
- * Last edited: Oct 22 11:20:12 2025 (cz370)
+ * Last edited: Apr 29 13:55:12 2026 (cz370)
  * Created: Wed Sep  5 22:13:53 2025 (cz370)
  *-------------------------------------------------------------------
  */
@@ -123,6 +123,7 @@ static size_t sam_hdr_lite_min_text_len(sam_hdr_lite_t *hdr);
 static bool sam_hdr_lite_build_targets_tbl(sam_hdr_lite_t *hdr);
 static bool sam_hdr_lite_build_targets_map(sam_hdr_lite_t *hdr);
 static ssize_t sam_hdr_lite_add_lines(sam_hdr_lite_t *hdr, const char *lines, size_t len);
+static ssize_t sam_hdr_lite_add_pg(sam_hdr_lite_t *hdr, const char *id, const char *vn, const char *cl);
 static int sam_hdr_lite_build_HD(sam_hdr_lite_t *hdr, const char *vn, const char *so);
 static inline int sam_read1_lite(samFile *fp, sam_hdr_lite_t *header, bam1_t *b);
 static inline int bam_read1_lite(samFile *fp, sam_hdr_lite_t *header, bam1_t *b);
@@ -1195,30 +1196,109 @@ typedef struct {
     void *writer;
 } merge_args_t;
 
+
+const static uint16_t SECFLAG = (BAM_FSECONDARY | BAM_FSUPPLEMENTARY);
+
+static inline int32_t get_AS_score(const bam1_t *b) {
+    uint8_t *tag = bam_aux_get(b, "AS");
+    if (tag == NULL)
+        return INT32_MIN;
+    int64_t val = bam_aux2i(tag);
+    return (int32_t) val;
+}
+
+static inline int is_read2(const bam1_t *b) {
+    return (b->core.flag & BAM_FREAD2) != 0;
+}
+
+static inline int bw_bam_write_secondary(bam1_t *p_dat, bam1_t *rec, bam1_t **p_rec, int *max_as, bam_writer_t *bw)
+{
+    if (rec->core.flag & SECFLAG)
+        // secondary or supplementary record - write directly
+        return bw_bam_write1(bw, rec);
+    if (*p_rec == NULL) {
+        // first primary record - save to p_rec
+        *p_rec = bam_copy1(p_dat, rec);
+        *max_as = get_AS_score(rec);
+        return 0;
+    }
+    // need to compare AS score
+    int32_t as = get_AS_score(rec);
+    int res = 0;
+    if (as > *max_as) {
+        // write the previous primary record
+        p_dat->core.flag |= BAM_FSECONDARY; // mark as secondary
+        res = bw_bam_write1(bw, p_dat);
+        // update p_rec to the new primary record
+        *p_rec = bam_copy1(p_dat, rec);
+        *max_as = as;
+    } else {
+        // write this record as secondary
+        rec->core.flag |= BAM_FSECONDARY; // mark as secondary
+        res = bw_bam_write1(bw, rec);
+    }
+    if (*p_rec == NULL) {
+        errmsg("failed copying BAM record");
+        exit(1);
+    }
+    return res;
+}
+
 static void *bam_merge_thread(void *args)
 {
     merge_args_t *margs = (merge_args_t *) args;
     int T = margs->T;
     heap_t *heaps = margs->heaps;
-    bam_writer_t *writer = (bam_writer_t *) margs->writer;
+    bam_writer_t *bw = (bam_writer_t *) margs->writer;
     int i, j, n, m, t, *list;
     size_t n_recs = 0, n_prev = 0;
-    bam1_t **recs;
-    int res, *lcps;
+    bam1_t *p_dat[2], *p_rec[2], **recs;
+    int res, new, rd2, p_mas[2], *lcps;
     char *dups;
     Merge *merge = mergeCreateString(T, heaps, yield);
+    p_dat[0] = bam_init1(); // for 1st read primary record
+    p_dat[1] = bam_init1(); // for 2nd read primary record
+    p_rec[0] = p_rec[1] = NULL;
+    p_mas[0] = p_mas[1] = INT32_MIN;
+    new = 0;
     push_time(&TIME_STACK);
     // do merging
     while ((m = mergeNext(merge, &list))) {
+        // write primary record if necessary
+        if (p_rec[0] || p_rec[1]) {
+            if (new) {
+                // we could still have the same read from next data chunk
+                t = list[0];
+                j = heaps[t].i - 1;
+                recs = heaps[t].recs;
+                if ((p_rec[0] && strcmp((char *)p_rec[0]->data, (char *)recs[j]->data)) ||
+                    (p_rec[1] && strcmp((char *)p_rec[1]->data, (char *)recs[j]->data)))
+                    new = 0; // we moved to next read
+            }
+            if (!new) {
+                // this must be a new read
+                if ((p_rec[0] && bw_bam_write1(bw, p_rec[0]) < 0) || 
+                    (p_rec[1] && bw_bam_write1(bw, p_rec[1]) < 0)) {
+                    errmsg("failed writing BAM record");
+                    exit(1);
+                }
+                p_rec[0] = p_rec[1] = NULL;
+                p_mas[0] = p_mas[1] = INT32_MIN;
+            }
+        }
+        new = 0;
         for (i = 0; i < m; i++) {
             t = list[i];
             j = heaps[t].i - 1;
             n = heaps[t].n;
             recs = heaps[t].recs;
             lcps = heaps[t].lcps;
-            res = bw_bam_write1(writer, recs[j]);
-            while (++j < n && lcps[j] < 0)
-                res |= bw_bam_write1(writer, recs[j]);
+            rd2 = is_read2(recs[j]);
+            res = bw_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, bw);
+            while (++j < n && lcps[j] < 0) {
+                rd2 = is_read2(recs[j]);
+                res |= bw_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, bw);
+            }
             if (res < 0) {
                 errmsg("failed writing BAM record");
                 exit(1);
@@ -1236,6 +1316,7 @@ static void *bam_merge_thread(void *args)
                 }
                 free(heaps[t].dups);
                 heaps[t].dups = dups;
+                new = 1; // will load a new chunk of data
             }
         }
         if (n_recs >= 10000000 + n_prev) {
@@ -1244,11 +1325,52 @@ static void *bam_merge_thread(void *args)
             n_prev = n_recs;
         }
     }
+    // write the last primary record if exists
+    if ((p_rec[0] && bw_bam_write1(bw, p_rec[0]) < 0) ||
+        (p_rec[1] && bw_bam_write1(bw, p_rec[1]) < 0)) {
+        errmsg("failed writing BAM record");
+        exit(1);
+    }
     infomsg("processed %12zu records in %.3f seconds", 
         n_recs, pop_time(&TIME_STACK));
 
     mergeDestroy(merge);
+    bam_destroy1(p_dat[0]);
+    bam_destroy1(p_dat[1]);
     return NULL;
+}
+
+static inline int zstd_bam_write_secondary(bam1_t *p_dat, bam1_t *rec, bam1_t **p_rec, int *max_as, zstd_writer_t *zw)
+{
+    if (rec->core.flag & SECFLAG)
+        // secondary or supplementary record - write directly
+        return zstd_bam_write1(zw, rec);
+    if (*p_rec == NULL) {
+        // first primary record - save to p_rec
+        *p_rec = bam_copy1(p_dat, rec);
+        *max_as = get_AS_score(rec);
+        return 0;
+    }
+    // need to compare AS score
+    int32_t as = get_AS_score(rec);
+    int res = 0;
+    if (as > *max_as) {
+        // write the previous primary record
+        p_dat->core.flag |= BAM_FSECONDARY; // mark as secondary
+        res = zstd_bam_write1(zw, p_dat);
+        // update p_rec to the new primary record
+        *p_rec = bam_copy1(p_dat, rec);
+        *max_as = as;
+    } else {
+        // write this record as secondary
+        rec->core.flag |= BAM_FSECONDARY; // mark as secondary
+        res = zstd_bam_write1(zw, rec);
+    }
+    if (*p_rec == NULL) {
+        errmsg("failed copying BAM record");
+        exit(1);
+    }
+    return res;
 }
 
 static void *zst_merge_thread(void *args)
@@ -1256,25 +1378,56 @@ static void *zst_merge_thread(void *args)
     merge_args_t *margs = (merge_args_t *) args;
     int T = margs->T;
     heap_t *heaps = margs->heaps;
-    zstd_writer_t *fp = (zstd_writer_t *)margs->writer;
+    zstd_writer_t *zw = (zstd_writer_t *)margs->writer;
     int i, j, n, m, t, *list;
     size_t n_recs = 0, n_prev = 0;
-    bam1_t **recs;
-    int res, *lcps;
+    bam1_t *p_dat[2], *p_rec[2], **recs;
+    int res, new, rd2, p_mas[2], *lcps;
     char *dups;
     Merge *merge = mergeCreateString(T, heaps, yield);
+    p_dat[0] = bam_init1(); // for 1st read primary record
+    p_dat[1] = bam_init1(); // for 2nd read primary record
+    p_rec[0] = p_rec[1] = NULL;
+    p_mas[0] = p_mas[1] = INT32_MIN;
+    new = 0;
     push_time(&TIME_STACK);
     // do merging
     while ((m = mergeNext(merge, &list))) {
+        // write primary record if necessary
+        if (p_rec[0] || p_rec[1]) {
+            if (new) {
+                // we could still have the same read from next data chunk
+                t = list[0];
+                j = heaps[t].i - 1;
+                recs = heaps[t].recs;
+                if ((p_rec[0] && strcmp((char *)p_rec[0]->data, (char *)recs[j]->data)) ||
+                    (p_rec[1] && strcmp((char *)p_rec[1]->data, (char *)recs[j]->data)))
+                    new = 0; // we moved to next read
+            }
+            if (!new) {
+                // this must be a new read
+                if ((p_rec[0] && zstd_bam_write1(zw, p_rec[0]) < 0) || 
+                    (p_rec[1] && zstd_bam_write1(zw, p_rec[1]) < 0)) {
+                    errmsg("failed writing BAM record");
+                    exit(1);
+                }
+                p_rec[0] = p_rec[1] = NULL;
+                p_mas[0] = p_mas[1] = INT32_MIN;
+            }
+        }
+        new = 0;
         for (i = 0; i < m; i++) {
             t = list[i];
             j = heaps[t].i - 1;
             n = heaps[t].n;
             recs = heaps[t].recs;
             lcps = heaps[t].lcps;
-            res = zstd_bam_write1(fp, recs[j]);
-            while (++j < n && lcps[j] < 0)
-                res |= zstd_bam_write1(fp, recs[j]);
+            rd2 = is_read2(recs[j]);
+            res = zstd_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, zw);
+            while (++j < n && lcps[j] < 0) {
+                rd2 = is_read2(recs[j]);
+                res |= zstd_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, zw);
+            }
             if (res < 0) {
                 errmsg("failed writing BAM record");
                 exit(1);
@@ -1292,6 +1445,7 @@ static void *zst_merge_thread(void *args)
                 }
                 free(heaps[t].dups);
                 heaps[t].dups = dups;
+                new = 1; // will load a new chunk of data
             }
         }
         if (n_recs >= 10000000 + n_prev) {
@@ -1300,7 +1454,13 @@ static void *zst_merge_thread(void *args)
             n_prev = n_recs;
         }
     }
-    if (zstd_writer_flush(fp) < 0) {
+    // write the last primary record if exists
+    if ((p_rec[0] && zstd_bam_write1(zw, p_rec[0]) < 0) ||
+        (p_rec[1] && zstd_bam_write1(zw, p_rec[1]) < 0)) {
+        errmsg("failed writing BAM record");
+        exit(1);
+    }
+    if (zstd_writer_flush(zw) < 0) {
         errmsg("failed to flush ZSTD writer");
         exit(1);
     }
@@ -1308,6 +1468,8 @@ static void *zst_merge_thread(void *args)
         n_recs, pop_time(&TIME_STACK));
     
     mergeDestroy(merge);
+    bam_destroy1(p_dat[0]);
+    bam_destroy1(p_dat[1]);
     return NULL;
 }
 
@@ -1688,24 +1850,42 @@ static bool yield1(int t, void *data, char **s, int *p)
     } else return false;
 }
 
+
 static bool bam_merge(heap_t *heaps, int T, void *writer)
 {
-    int i, j, n, m, t, res, *list, *lcps;
-    bam1_t **recs;
+    int i, j, n, m, t, res, rd2, p_mas[2], *list, *lcps;
+    bam1_t *p_dat[2], *p_rec[2], **recs;
     bool ret = false;
     bam_writer_t *bw = (bam_writer_t *) writer;
     Merge *merge = mergeCreateString(T, heaps, yield1);
+    p_dat[0] = bam_init1(); // for 1st read primary record
+    p_dat[1] = bam_init1(); // for 2nd read primary record
+    p_rec[0] = p_rec[1] = NULL;
+    p_mas[0] = p_mas[1] = INT32_MIN;
     // do merging
     while ((m = mergeNext(merge, &list))) {
+        // write primary record if necessary
+        if (p_rec[0] || p_rec[1]) {
+            if ((p_rec[0] && bw_bam_write1(bw, p_rec[0]) < 0) || 
+                (p_rec[1] && bw_bam_write1(bw, p_rec[1]) < 0)) {
+                errmsg("failed writing BAM record");
+                goto err;
+            }
+            p_rec[0] = p_rec[1] = NULL;
+            p_mas[0] = p_mas[1] = INT32_MIN;
+        }
         for (i = 0; i < m; i++) {
             t = list[i];
             j = heaps[t].i - 1;
             n = heaps[t].n;
             recs = heaps[t].recs;
             lcps = heaps[t].lcps;
-            res = bw_bam_write1(bw, recs[j]);
-            while (++j < n && lcps[j] < 0)
-                res |= bw_bam_write1(bw, recs[j]);
+            rd2 = is_read2(recs[j]);
+            res = bw_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, bw);
+            while (++j < n && lcps[j] < 0) {
+                rd2 = is_read2(recs[j]);
+                res |= bw_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, bw);
+            }
             if (res < 0) {
                 errmsg("failed writing BAM record");
                 goto err;
@@ -1713,32 +1893,57 @@ static bool bam_merge(heap_t *heaps, int T, void *writer)
             heaps[t].i = j;
         }
     }
+    // write the last primary record if exists
+    if ((p_rec[0] && bw_bam_write1(bw, p_rec[0]) < 0) ||
+        (p_rec[1] && bw_bam_write1(bw, p_rec[1]) < 0)) {
+        errmsg("failed writing BAM record");
+        goto err;
+    }
     ret = true;
 
 err:
     mergeDestroy(merge);
+    bam_destroy1(p_dat[0]);
+    bam_destroy1(p_dat[1]);
     return ret;
 }
 
 
 static bool zst_merge(heap_t *heaps, int T, void *writer)
 {
-    int i, j, n, m, t, res, *list, *lcps;
-    bam1_t **recs;
+    int i, j, n, m, t, res, rd2, p_mas[2], *list, *lcps;
+    bam1_t *p_dat[2], *p_rec[2], **recs;
     bool ret = false;
-    zstd_writer_t *fp = (zstd_writer_t *)writer;
+    zstd_writer_t *zw = (zstd_writer_t *)writer;
     Merge *merge = mergeCreateString(T, heaps, yield1);
+    p_dat[0] = bam_init1(); // for 1st read primary record
+    p_dat[1] = bam_init1(); // for 2nd read primary record
+    p_rec[0] = p_rec[1] = NULL;
+    p_mas[0] = p_mas[1] = INT32_MIN;
     // do merging
     while ((m = mergeNext(merge, &list))) {
+        // write primary record if necessary
+        if (p_rec[0] || p_rec[1]) {
+            if ((p_rec[0] && zstd_bam_write1(zw, p_rec[0]) < 0) || 
+                (p_rec[1] && zstd_bam_write1(zw, p_rec[1]) < 0)) {
+                errmsg("failed writing BAM record");
+                goto err;
+            }
+            p_rec[0] = p_rec[1] = NULL;
+            p_mas[0] = p_mas[1] = INT32_MIN;
+        }
         for (i = 0; i < m; i++) {
             t = list[i];
             j = heaps[t].i - 1;
             n = heaps[t].n;
             recs = heaps[t].recs;
             lcps = heaps[t].lcps;
-            res = zstd_bam_write1(fp, recs[j]);
-            while (++j < n && lcps[j] < 0)
-                res |= zstd_bam_write1(fp, recs[j]);
+            rd2 = is_read2(recs[j]);
+            res = zstd_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, zw);
+            while (++j < n && lcps[j] < 0) {
+                rd2 = is_read2(recs[j]);
+                res |= zstd_bam_write_secondary(p_dat[rd2], recs[j], p_rec+rd2, p_mas+rd2, zw);
+            }
             if (res < 0) {
                 errmsg("failed writing BAM record");
                 goto err;
@@ -1746,7 +1951,13 @@ static bool zst_merge(heap_t *heaps, int T, void *writer)
             heaps[t].i = j;
         }
     }
-    if (zstd_writer_flush(writer) < 0) {
+    // write the last primary record if exists
+    if ((p_rec[0] && zstd_bam_write1(zw, p_rec[0]) < 0) || 
+        (p_rec[1] && zstd_bam_write1(zw, p_rec[1]) < 0)) {
+        errmsg("failed writing BAM record");
+        goto err;
+    }
+    if (zstd_writer_flush(zw) < 0) {
         errmsg("failed to flush ZSTD writer");
         goto err;
     }
@@ -1754,6 +1965,8 @@ static bool zst_merge(heap_t *heaps, int T, void *writer)
 
 err:
     mergeDestroy(merge);
+    bam_destroy1(p_dat[0]);
+    bam_destroy1(p_dat[1]);
     return ret;
 }
 
@@ -2322,6 +2535,10 @@ bool bamsort(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threa
             }
         }
     }
+    if (sam_hdr_lite_add_pg(header, "onebam", VERSION, getCommandLine()) < 0) {
+        errmsg("failed to add PG line to SAM header");
+        goto err;
+    }
     if (sam_hdr_lite_build_HD(header, NULL, "queryname") < 0) {
         errmsg("failed to build SAM header HD line");
         goto err;
@@ -2658,6 +2875,10 @@ bool mergebam(char **infiles, int nIn, char *outfile, size_t max_mem, int n_thre
             sam_hdr_lite_destroy(header);
             srt_data[i].header = NULL;
         }
+    }
+    if (sam_hdr_lite_add_pg(builder, "onebam", VERSION, getCommandLine()) < 0) {
+        errmsg("failed to add PG line to SAM header");
+        goto err;
     }
     if (sam_hdr_lite_build_HD(builder, NULL, "queryname") < 0) {
         errmsg("failed to build SAM header HD line");
@@ -4954,6 +5175,28 @@ static inline ssize_t sam_hdr_lite_add_lines(sam_hdr_lite_t *hdr, const char *li
 err:
     errmsg("failed to add SAM header lines");
     return -1;
+}
+
+static ssize_t sam_hdr_lite_add_pg(sam_hdr_lite_t *hdr, const char *id, const char *vn, const char *cl)
+{
+    ssize_t llen;
+    char *line;
+    
+    // line format: "@PG\tID:%s\tPN:%s\tVN:%s\tCL:%s\n"
+    llen = 4 + 8 + 2*strlen(id) + 4 + strlen(vn) + 4 + strlen(cl);
+    line = (char *)malloc(llen + 1);
+    if (!line) {
+        errmsg("failed to allocate memory for @PG line");
+        return -1;
+    }
+    sprintf(line, "@PG\tID:%s\tPN:%s\tVN:%s\tCL:%s\n", id, id, vn, cl);
+    if (cstr_array_putsn(line, llen, &hdr->pg_text) < 0) {
+        free(line);
+        errmsg("failed to add @PG line");
+        return -1;
+    }
+    free(line);
+    return llen;
 }
 
 sam_hdr_lite_t *sam_hdr_lite_create(samFile *fp)
