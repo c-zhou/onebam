@@ -123,6 +123,7 @@ static size_t sam_hdr_lite_min_text_len(sam_hdr_lite_t *hdr);
 static bool sam_hdr_lite_build_targets_tbl(sam_hdr_lite_t *hdr);
 static bool sam_hdr_lite_build_targets_map(sam_hdr_lite_t *hdr);
 static ssize_t sam_hdr_lite_add_lines(sam_hdr_lite_t *hdr, const char *lines, size_t len);
+static ssize_t sam_hdr_lite_add_pg(sam_hdr_lite_t *hdr, const char *id, const char *vn, const char *cl);
 static int sam_hdr_lite_build_HD(sam_hdr_lite_t *hdr, const char *vn, const char *so);
 static inline int sam_read1_lite(samFile *fp, sam_hdr_lite_t *header, bam1_t *b);
 static inline int bam_read1_lite(samFile *fp, sam_hdr_lite_t *header, bam1_t *b);
@@ -2534,6 +2535,10 @@ bool bamsort(char **infiles, int nIn, char *outfile, size_t max_mem, int n_threa
             }
         }
     }
+    if (sam_hdr_lite_add_pg(header, "onebam", VERSION, getCommandLine()) < 0) {
+        errmsg("failed to add PG line to SAM header");
+        goto err;
+    }
     if (sam_hdr_lite_build_HD(header, NULL, "queryname") < 0) {
         errmsg("failed to build SAM header HD line");
         goto err;
@@ -2870,6 +2875,10 @@ bool mergebam(char **infiles, int nIn, char *outfile, size_t max_mem, int n_thre
             sam_hdr_lite_destroy(header);
             srt_data[i].header = NULL;
         }
+    }
+    if (sam_hdr_lite_add_pg(builder, "onebam", VERSION, getCommandLine()) < 0) {
+        errmsg("failed to add PG line to SAM header");
+        goto err;
     }
     if (sam_hdr_lite_build_HD(builder, NULL, "queryname") < 0) {
         errmsg("failed to build SAM header HD line");
@@ -5166,6 +5175,28 @@ static inline ssize_t sam_hdr_lite_add_lines(sam_hdr_lite_t *hdr, const char *li
 err:
     errmsg("failed to add SAM header lines");
     return -1;
+}
+
+static ssize_t sam_hdr_lite_add_pg(sam_hdr_lite_t *hdr, const char *id, const char *vn, const char *cl)
+{
+    ssize_t llen;
+    char *line;
+    
+    // line format: "@PG\tID:%s\tPN:%s\tVN:%s\tCL:%s\n"
+    llen = 4 + 8 + 2*strlen(id) + 4 + strlen(vn) + 4 + strlen(cl);
+    line = (char *)malloc(llen + 1);
+    if (!line) {
+        errmsg("failed to allocate memory for @PG line");
+        return -1;
+    }
+    sprintf(line, "@PG\tID:%s\tPN:%s\tVN:%s\tCL:%s\n", id, id, vn, cl);
+    if (cstr_array_putsn(line, llen, &hdr->pg_text) < 0) {
+        free(line);
+        errmsg("failed to add @PG line");
+        return -1;
+    }
+    free(line);
+    return llen;
 }
 
 sam_hdr_lite_t *sam_hdr_lite_create(samFile *fp)
