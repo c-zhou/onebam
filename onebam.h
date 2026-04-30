@@ -16,7 +16,7 @@
 #include "taxonomy.h"
 #include "ONElib.h"
 
-#define VERSION "0.2"
+#define VERSION "1.1"
 
 /********* first the user API for reading/writing .1read files, in oneread.c  *********/
 
